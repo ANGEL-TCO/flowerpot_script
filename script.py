@@ -1,12 +1,15 @@
-# Rhino 8 - Faceted Argyle Bucket (polygonal outer wall)
 import rhinoscriptsyntax as rs
 import Rhino
 import scriptcontext as sc
 import math
 
+# -------------------------
+# Helpers
+# -------------------------
 def clamp(v,a,b): return max(a,min(b,v))
+
 def smoothstep(t):
-    t = clamp(float(t),0.0,1.0)
+    t = clamp(float(t), 0.0, 1.0)
     return t*t*(3.0-2.0*t)
 
 def edge_fade(z01, fade_zone):
@@ -16,6 +19,56 @@ def edge_fade(z01, fade_zone):
     if z01 > 1.0 - s: return smoothstep((1.0-z01)/s)
     return 1.0
 
+def stitch_rings_tri(mesh, ringA, ringB):
+    """
+    Stitch two closed rings (lists of vertex indices) with triangles.
+    Works even if len(ringA) != len(ringB).
+
+    Assumption: both rings are ordered CCW when seen from outside,
+    and correspond roughly by angle (same orientation).
+    """
+    nA = len(ringA)
+    nB = len(ringB)
+    if nA < 3 or nB < 3:
+        return
+
+    i = 0
+    j = 0
+    # Use normalized progress around each ring to decide next triangle
+    while i < nA and j < nB:
+        i2 = (i + 1) % nA
+        j2 = (j + 1) % nB
+
+        # progress ratios (0..1)
+        a_next = float(i + 1) / float(nA)
+        b_next = float(j + 1) / float(nB)
+
+        a0 = ringA[i]
+        a1 = ringA[i2]
+        b0 = ringB[j]
+        b1 = ringB[j2]
+
+        if a_next < b_next:
+            # advance A: triangle (a0, a1, b0)
+            mesh.Faces.AddFace(a0, a1, b0)
+            i += 1
+            if i == nA: break
+        elif b_next < a_next:
+            # advance B: triangle (a0, b1, b0)
+            mesh.Faces.AddFace(a0, b1, b0)
+            j += 1
+            if j == nB: break
+        else:
+            # advance both: quad split into 2 tris
+            mesh.Faces.AddFace(a0, a1, b1)
+            mesh.Faces.AddFace(a0, b1, b0)
+            i += 1
+            j += 1
+            if i == nA or j == nB: break
+
+# -------------------------
+# Build
+# -------------------------
 def build_faceted_bucket(
     base_pt,
     height,
@@ -25,113 +78,127 @@ def build_faceted_bucket(
     diamonds_around=5,
     diamonds_vertical=3,
     facet_depth=3.0,
-    fade_zone=0.12,
-    bevel_height=6.0,     # top/bottom straight "bevel band" height
-    bevel_inset=2.0       # how much to pull-in radius in bevel band
+    fade_zone=0.10,
+    bevel_height=6.0,
+    bevel_inset=2.0,
+    inner_seg_u=120  # <- IMPORTANT: independent inner resolution for perfect circle
 ):
-    """
-    Outer wall = rhombus quad grid:
-      around segments = 2*diamonds_around
-      vertical rings  = 2*diamonds_vertical
-    Rings alternate a half-step angular offset => quads become rhombi.
-    Relief is binary (+/-) => crisp planar-ish facets + polygonal silhouette.
-    """
-
-    H  = float(height)
+    H   = float(height)
     Rin = float(inner_radius)
-    T  = float(wall_thickness)
-    B  = float(base_thickness)
+    T   = float(wall_thickness)
+    B   = float(base_thickness)
 
     Rout = Rin + T
-    B = clamp(B, 0.5, H*0.9)
+    B = clamp(B, 0.5, H * 0.9)
 
-    # --- topology that matches argyle ---
-    seg_u = max(6, int(2 * diamonds_around))         # corners around
-    seg_v = max(2, int(2 * diamonds_vertical))       # rings up
-    cols = seg_u + 1                                 # seam dup
-    rows = seg_v + 1
+    # --- OUTER topology matches rhombus grid ---
+    outer_seg_u = max(6, int(2 * diamonds_around))       # corners around
+    outer_seg_v = max(2, int(2 * diamonds_vertical))     # rings up
+    outer_cols  = outer_seg_u + 1
+    outer_rows  = outer_seg_v + 1
+
+    # --- INNER topology: smooth circle, no offsets ---
+    inner_seg_u = max(24, int(inner_seg_u))
+    inner_seg_v = outer_seg_v  # keep same vertical ring count for consistency
+    inner_cols  = inner_seg_u + 1
+    inner_rows  = inner_seg_v + 1
 
     outer = Rhino.Geometry.Mesh()
     inner = Rhino.Geometry.Mesh()
 
-    # ---- vertices ----
-    for j in range(rows):
-        v01 = float(j) / float(seg_v)    # 0..1 along height
+    # -------------------------
+    # OUTER vertices (faceted)
+    # -------------------------
+    for j in range(outer_rows):
+        v01 = float(j) / float(outer_seg_v)
         z = H * v01
 
-        # alternate ring offset: makes rhombi
-        theta_off = (math.pi / seg_u) if (j % 2 == 1) else 0.0
-
-        # fade facet depth near top/bottom
+        theta_off = (math.pi / outer_seg_u) if (j % 2 == 1) else 0.0
         fade = edge_fade(v01, fade_zone)
 
-        # bevel bands to imitate the "straight-ish" rim/base edge you marked in red
+        # bevel band to keep rim/base cleaner & more "straight"
         bevel = 0.0
         if bevel_height > 0.0:
             if z < bevel_height:
-                # bottom bevel: inset strongest at z=0
                 t = 1.0 - (z / bevel_height)
                 bevel = -bevel_inset * smoothstep(t)
             elif z > (H - bevel_height):
-                # top bevel: inset strongest at z=H
                 t = 1.0 - ((H - z) / bevel_height)
                 bevel = -bevel_inset * smoothstep(t)
 
-        for i in range(cols):
-            u01 = float(i) / float(seg_u)
+        for i in range(outer_cols):
+            u01 = float(i) / float(outer_seg_u)
             theta = 2.0 * math.pi * u01 + theta_off
 
-            # Binary facet pattern (checkerboard in the diamond grid).
-            # This is what creates the "polygon from rhombus union" feel.
+            # checkerboard relief (crisp facets)
             s = 1.0 if ((i + j) % 2 == 0) else -1.0
-
             relief = facet_depth * fade * s
+
             r_out = Rout + relief + bevel
 
-            # OUTER point
-            x_out = base_pt.X + r_out * math.cos(theta)
-            y_out = base_pt.Y + r_out * math.sin(theta)
-            z_out = base_pt.Z + z
-            outer.Vertices.Add(x_out, y_out, z_out)
+            x = base_pt.X + r_out * math.cos(theta)
+            y = base_pt.Y + r_out * math.sin(theta)
+            zz = base_pt.Z + z
+            outer.Vertices.Add(x, y, zz)
 
-            # INNER wall = perfect cylinder (starts at base floor)
-            # inner side goes from z=B..H (we'll build with same rows for simplicity)
-            z_in = base_pt.Z + max(B, z)
-            x_in = base_pt.X + Rin * math.cos(theta)
-            y_in = base_pt.Y + Rin * math.sin(theta)
-            inner.Vertices.Add(x_in, y_in, z_in)
+    def o_vid(ii, jj):
+        return jj * outer_cols + ii
 
-    def vid(ii, jj):
-        return jj * cols + ii
-
-    # ---- faces (rhombus quads) ----
-    for j in range(seg_v):
-        for i in range(seg_u):
-            a = vid(i, j)
-            b = vid(i+1, j)
-            c = vid(i+1, j+1)
-            d = vid(i, j+1)
-
+    for j in range(outer_seg_v):
+        for i in range(outer_seg_u):
+            a = o_vid(i, j)
+            b = o_vid(i + 1, j)
+            c = o_vid(i + 1, j + 1)
+            d = o_vid(i, j + 1)
             outer.Faces.AddFace(a, b, c, d)
-            # inner is reversed (we'll flip later)
-            inner.Faces.AddFace(a, d, c, b)
+
+    # Outer bottom cap
+    outer_center = outer.Vertices.Add(base_pt.X, base_pt.Y, base_pt.Z)
+    for i in range(outer_seg_u):
+        outer.Faces.AddFace(outer_center, o_vid(i + 1, 0), o_vid(i, 0))
 
     outer.Normals.ComputeNormals()
+    outer.Compact()
+
+    # -------------------------
+    # INNER vertices (perfect circle)
+    # Inner starts at z=B (floor), up to z=H
+    # -------------------------
+    for j in range(inner_rows):
+        v01 = float(j) / float(inner_seg_v)
+        z = B + (H - B) * v01
+
+        for i in range(inner_cols):
+            u01 = float(i) / float(inner_seg_u)
+            theta = 2.0 * math.pi * u01  # <- no offset, uniform circle
+
+            x = base_pt.X + Rin * math.cos(theta)
+            y = base_pt.Y + Rin * math.sin(theta)
+            zz = base_pt.Z + z
+            inner.Vertices.Add(x, y, zz)
+
+    def i_vid(ii, jj):
+        return jj * inner_cols + ii
+
+    for j in range(inner_seg_v):
+        for i in range(inner_seg_u):
+            a = i_vid(i, j)
+            b = i_vid(i + 1, j)
+            c = i_vid(i + 1, j + 1)
+            d = i_vid(i, j + 1)
+            inner.Faces.AddFace(a, b, c, d)
+
+    # Inner floor cap at z=B
+    inner_center = inner.Vertices.Add(base_pt.X, base_pt.Y, base_pt.Z + B)
+    for i in range(inner_seg_u):
+        inner.Faces.AddFace(inner_center, i_vid(i, 0), i_vid(i + 1, 0))
+
     inner.Normals.ComputeNormals()
+    inner.Compact()
 
-    # ---- close bottoms ----
-    # Outer bottom cap (z=0)
-    outer_center = outer.Vertices.Add(base_pt.X, base_pt.Y, base_pt.Z)
-    for i in range(seg_u):
-        outer.Faces.AddFace(outer_center, vid(i+1, 0), vid(i, 0))
-
-    # Inner floor cap at z=B (so the bucket isn't bottomless)
-    # We added inner vertices clamped to z>=B, so row 0 is already at z=B.
-    inner_floor_center = inner.Vertices.Add(base_pt.X, base_pt.Y, base_pt.Z + B)
-    for i in range(seg_u):
-        inner.Faces.AddFace(inner_floor_center, vid(i, 0), vid(i+1, 0))
-
-    # ---- shell: outer + flipped inner ----
+    # -------------------------
+    # Combine into closed shell
+    # -------------------------
     inner2 = inner.DuplicateMesh()
     inner2.Flip(True, True, True)
 
@@ -140,14 +207,12 @@ def build_faceted_bucket(
     outer_count = outer.Vertices.Count
     shell.Append(inner2)
 
-    # ---- top rim bridge (outer top ring to inner top ring) ----
-    top_j = seg_v
-    def o(ii, jj): return vid(ii, jj)
-    def inn(ii, jj): return outer_count + vid(ii, jj)
+    # Top ring indices
+    outer_top_ring = [o_vid(i, outer_seg_v) for i in range(outer_seg_u)]  # no seam dup
+    inner_top_ring = [outer_count + i_vid(i, inner_seg_v) for i in range(inner_seg_u)]  # no seam dup
 
-    for i in range(seg_u):
-        i2 = i + 1
-        shell.Faces.AddFace(o(i, top_j), o(i2, top_j), inn(i2, top_j), inn(i, top_j))
+    # Stitch top rim between outer and inner (triangles)
+    stitch_rings_tri(shell, outer_top_ring, inner_top_ring)
 
     shell.UnifyNormals()
     shell.Normals.ComputeNormals()
@@ -155,6 +220,9 @@ def build_faceted_bucket(
 
     return shell
 
+# -------------------------
+# UI / Main
+# -------------------------
 def main():
     rs.EnableRedraw(False)
 
@@ -190,6 +258,9 @@ def main():
     bevel_in = rs.GetReal("Bevel inset (mm)", 2.0, 0.0, 30.0)
     if bevel_in is None: rs.EnableRedraw(True); return
 
+    inner_seg_u = rs.GetInteger("Inner circle segments (80-200)", 140, 24, 400)
+    if inner_seg_u is None: rs.EnableRedraw(True); return
+
     mesh = build_faceted_bucket(
         base_pt=base_pt,
         height=H,
@@ -201,11 +272,12 @@ def main():
         facet_depth=facet_depth,
         fade_zone=0.10,
         bevel_height=bevel_h,
-        bevel_inset=bevel_in
+        bevel_inset=bevel_in,
+        inner_seg_u=inner_seg_u
     )
 
     if mesh:
-        # make facets read sharper
+        # Keep outer facets crisp
         mesh.Unweld(math.radians(35.0), True)
         sc.doc.Objects.AddMesh(mesh)
         sc.doc.Views.Redraw()
