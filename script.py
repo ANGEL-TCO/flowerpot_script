@@ -1,240 +1,153 @@
-# Argyle Bucket Generator (Rhino 8)
-# Inner wall: perfect cylinder
-# Outer wall: ring-based points with rhombus (argyle) pattern
-# Solid: has base thickness and closed mesh
-
+# Rhino 8 - Faceted Argyle Bucket (polygonal outer wall)
 import rhinoscriptsyntax as rs
 import Rhino
 import scriptcontext as sc
 import math
 
-# -------------------------
-# Helpers
-# -------------------------
-def clamp(v, a, b):
-    return max(a, min(b, v))
-
+def clamp(v,a,b): return max(a,min(b,v))
 def smoothstep(t):
-    t = clamp(float(t), 0.0, 1.0)
-    return t * t * (3.0 - 2.0 * t)
+    t = clamp(float(t),0.0,1.0)
+    return t*t*(3.0-2.0*t)
 
 def edge_fade(z01, fade_zone):
-    """Fade pattern near bottom/top so the rim/base look cleaner."""
     s = float(fade_zone)
-    if s <= 0.0:
-        return 1.0
-    if z01 < s:
-        return smoothstep(z01 / s)
-    if z01 > 1.0 - s:
-        return smoothstep((1.0 - z01) / s)
+    if s <= 0.0: return 1.0
+    if z01 < s: return smoothstep(z01/s)
+    if z01 > 1.0 - s: return smoothstep((1.0-z01)/s)
     return 1.0
 
-def diamond_value(u, v, diamonds_around, diamonds_vertical):
-    """
-    UV diamond (argyle) using Manhattan distance to cell center.
-    Returns roughly [-1..+1], where +1 is cell center, -1 near edges.
-    """
-    su = u * float(diamonds_around)
-    sv = v * float(diamonds_vertical)
-
-    fu = su - math.floor(su)  # 0..1
-    fv = sv - math.floor(sv)  # 0..1
-
-    d = abs(fu - 0.5) + abs(fv - 0.5)   # 0..1
-    h = 1.0 - 2.0 * d                   # +1 center, -1 edges
-    return clamp(h, -1.0, 1.0)
-
-def hard_facet(x, softness=0.15):
-    """
-    Turn a smooth [-1..1] into flatter facets.
-    softness -> 0 = very hard two-level; higher = softer transitions.
-    """
-    s = clamp(softness, 0.0, 1.0)
-    # Map to 0..1, apply smoothstep for controllable transition, map back
-    t = (x + 1.0) * 0.5
-    t = smoothstep(clamp((t - 0.5) / max(1e-6, s) + 0.5, 0.0, 1.0)) if s > 0 else (1.0 if t >= 0.5 else 0.0)
-    return (t * 2.0) - 1.0
-
-# -------------------------
-# Core build
-# -------------------------
-def build_bucket_mesh(
+def build_faceted_bucket(
     base_pt,
     height,
     inner_radius,
     wall_thickness,
     base_thickness,
-    seg_u=120,
-    seg_v=48,
     diamonds_around=5,
     diamonds_vertical=3,
     facet_depth=3.0,
     fade_zone=0.12,
-    facet_softness=0.18,
-    waist_amp=0.0,
-    waist_cycles=1.0
+    bevel_height=6.0,     # top/bottom straight "bevel band" height
+    bevel_inset=2.0       # how much to pull-in radius in bevel band
 ):
     """
-    Creates a closed mesh solid bucket:
-      - Outer surface: modulated radius (argyle facets)
-      - Outer bottom: sealed at z=0
-      - Inner surface: perfect cylinder (no pattern), starts at z=base_thickness
-      - Inner floor: sealed at z=base_thickness
-      - Top rim: bridged between inner and outer at z=height
+    Outer wall = rhombus quad grid:
+      around segments = 2*diamonds_around
+      vertical rings  = 2*diamonds_vertical
+    Rings alternate a half-step angular offset => quads become rhombi.
+    Relief is binary (+/-) => crisp planar-ish facets + polygonal silhouette.
     """
 
-    # --- normalize / safety ---
-    H = float(height)
+    H  = float(height)
     Rin = float(inner_radius)
-    T = float(wall_thickness)
-    B = float(base_thickness)
+    T  = float(wall_thickness)
+    B  = float(base_thickness)
 
-    seg_u = max(24, int(seg_u))
-    seg_v = max(10, int(seg_v))
-    diamonds_around = max(2, int(diamonds_around))
-    diamonds_vertical = max(1, int(diamonds_vertical))
+    Rout = Rin + T
+    B = clamp(B, 0.5, H*0.9)
 
-    # derive outer radius from inner + thickness
-    Rout_base = Rin + T
+    # --- topology that matches argyle ---
+    seg_u = max(6, int(2 * diamonds_around))         # corners around
+    seg_v = max(2, int(2 * diamonds_vertical))       # rings up
+    cols = seg_u + 1                                 # seam dup
+    rows = seg_v + 1
 
-    # clamp base thickness and thickness sanity
-    B = clamp(B, 0.5, H * 0.9)
-    T = clamp(T, 0.5, max(1.0, Rin * 2.0))
-
-    cols = seg_u + 1  # duplicate seam for clean wrap
-
-    # --------------------------------
-    # 1) OUTER MESH (side + bottom cap)
-    # --------------------------------
     outer = Rhino.Geometry.Mesh()
-
-    # Outer side vertices from z=0..H
-    for j in range(seg_v + 1):
-        v01 = float(j) / float(seg_v)
-        z = H * v01
-        fade = edge_fade(v01, fade_zone)
-
-        for i in range(cols):
-            u01 = float(i) / float(seg_u)
-            theta = 2.0 * math.pi * u01
-
-            # Diamond pattern (argyle)
-            d = diamond_value(u01, v01, diamonds_around, diamonds_vertical)
-            d = hard_facet(d, facet_softness)  # flatten to read as facets
-
-            # Optional waist (subtle “soft wavy” body like the photo)
-            waist = 0.0
-            if abs(waist_amp) > 1e-9:
-                waist = float(waist_amp) * math.sin(2.0 * math.pi * (waist_cycles * v01))
-
-            relief = float(facet_depth) * fade * d
-            r_out = Rout_base + relief + waist
-
-            x = base_pt.X + r_out * math.cos(theta)
-            y = base_pt.Y + r_out * math.sin(theta)
-            zz = base_pt.Z + z
-            outer.Vertices.Add(x, y, zz)
-
-    def o_vid(ii, jj):
-        return jj * cols + ii
-
-    # Outer side faces (quads)
-    for j in range(seg_v):
-        for i in range(seg_u):
-            a = o_vid(i, j)
-            b = o_vid(i + 1, j)
-            c = o_vid(i + 1, j + 1)
-            d = o_vid(i, j + 1)
-            outer.Faces.AddFace(a, b, c, d)
-
-    # Outer bottom cap (fan)
-    # Add center vertex at z=0
-    outer_center_idx = outer.Vertices.Add(base_pt.X, base_pt.Y, base_pt.Z)
-
-    # bottom ring is j=0
-    for i in range(seg_u):
-        a = outer_center_idx
-        b = o_vid(i + 1, 0)
-        c = o_vid(i, 0)
-        outer.Faces.AddFace(a, b, c)  # orientation for outward normals
-
-    outer.Normals.ComputeNormals()
-    outer.Compact()
-
-    # --------------------------------
-    # 2) INNER MESH (side + inner floor)
-    # --------------------------------
     inner = Rhino.Geometry.Mesh()
 
-    # Inner side starts at z=B .. H (perfect cylinder)
-    for j in range(seg_v + 1):
-        v01 = float(j) / float(seg_v)
-        z = B + (H - B) * v01  # maps 0..1 -> B..H
+    # ---- vertices ----
+    for j in range(rows):
+        v01 = float(j) / float(seg_v)    # 0..1 along height
+        z = H * v01
+
+        # alternate ring offset: makes rhombi
+        theta_off = (math.pi / seg_u) if (j % 2 == 1) else 0.0
+
+        # fade facet depth near top/bottom
+        fade = edge_fade(v01, fade_zone)
+
+        # bevel bands to imitate the "straight-ish" rim/base edge you marked in red
+        bevel = 0.0
+        if bevel_height > 0.0:
+            if z < bevel_height:
+                # bottom bevel: inset strongest at z=0
+                t = 1.0 - (z / bevel_height)
+                bevel = -bevel_inset * smoothstep(t)
+            elif z > (H - bevel_height):
+                # top bevel: inset strongest at z=H
+                t = 1.0 - ((H - z) / bevel_height)
+                bevel = -bevel_inset * smoothstep(t)
 
         for i in range(cols):
             u01 = float(i) / float(seg_u)
-            theta = 2.0 * math.pi * u01
+            theta = 2.0 * math.pi * u01 + theta_off
 
-            x = base_pt.X + Rin * math.cos(theta)
-            y = base_pt.Y + Rin * math.sin(theta)
-            zz = base_pt.Z + z
-            inner.Vertices.Add(x, y, zz)
+            # Binary facet pattern (checkerboard in the diamond grid).
+            # This is what creates the "polygon from rhombus union" feel.
+            s = 1.0 if ((i + j) % 2 == 0) else -1.0
 
-    def i_vid(ii, jj):
+            relief = facet_depth * fade * s
+            r_out = Rout + relief + bevel
+
+            # OUTER point
+            x_out = base_pt.X + r_out * math.cos(theta)
+            y_out = base_pt.Y + r_out * math.sin(theta)
+            z_out = base_pt.Z + z
+            outer.Vertices.Add(x_out, y_out, z_out)
+
+            # INNER wall = perfect cylinder (starts at base floor)
+            # inner side goes from z=B..H (we'll build with same rows for simplicity)
+            z_in = base_pt.Z + max(B, z)
+            x_in = base_pt.X + Rin * math.cos(theta)
+            y_in = base_pt.Y + Rin * math.sin(theta)
+            inner.Vertices.Add(x_in, y_in, z_in)
+
+    def vid(ii, jj):
         return jj * cols + ii
 
-    # Inner side faces (quads)
+    # ---- faces (rhombus quads) ----
     for j in range(seg_v):
         for i in range(seg_u):
-            a = i_vid(i, j)
-            b = i_vid(i + 1, j)
-            c = i_vid(i + 1, j + 1)
-            d = i_vid(i, j + 1)
-            inner.Faces.AddFace(a, b, c, d)
+            a = vid(i, j)
+            b = vid(i+1, j)
+            c = vid(i+1, j+1)
+            d = vid(i, j+1)
 
-    # Inner floor cap at z=B (fan)
-    inner_floor_center_idx = inner.Vertices.Add(base_pt.X, base_pt.Y, base_pt.Z + B)
+            outer.Faces.AddFace(a, b, c, d)
+            # inner is reversed (we'll flip later)
+            inner.Faces.AddFace(a, d, c, b)
 
-    # floor ring is j=0 in inner mesh
-    for i in range(seg_u):
-        a = inner_floor_center_idx
-        b = i_vid(i, 0)
-        c = i_vid(i + 1, 0)
-        inner.Faces.AddFace(a, b, c)  # orientation for inward normals (we'll flip later)
-
+    outer.Normals.ComputeNormals()
     inner.Normals.ComputeNormals()
-    inner.Compact()
 
-    # --------------------------------
-    # 3) SHELL: outer + flipped inner + top rim bridge
-    # --------------------------------
+    # ---- close bottoms ----
+    # Outer bottom cap (z=0)
+    outer_center = outer.Vertices.Add(base_pt.X, base_pt.Y, base_pt.Z)
+    for i in range(seg_u):
+        outer.Faces.AddFace(outer_center, vid(i+1, 0), vid(i, 0))
+
+    # Inner floor cap at z=B (so the bucket isn't bottomless)
+    # We added inner vertices clamped to z>=B, so row 0 is already at z=B.
+    inner_floor_center = inner.Vertices.Add(base_pt.X, base_pt.Y, base_pt.Z + B)
+    for i in range(seg_u):
+        inner.Faces.AddFace(inner_floor_center, vid(i, 0), vid(i+1, 0))
+
+    # ---- shell: outer + flipped inner ----
     inner2 = inner.DuplicateMesh()
-    inner2.Flip(True, True, True)  # boundary must face outward for solid
+    inner2.Flip(True, True, True)
 
     shell = Rhino.Geometry.Mesh()
     shell.Append(outer)
-
     outer_count = outer.Vertices.Count
     shell.Append(inner2)
 
-    # Indices mapping for inner2 inside shell:
-    # shell inner2 vertex k corresponds to (outer_count + k)
-    def shell_o(ii, jj):
-        return o_vid(ii, jj)
-
-    def shell_i(ii, jj):
-        return outer_count + i_vid(ii, jj)
-
-    # Top rim bridge: connect outer top ring (j=seg_v) to inner top ring (j=seg_v)
+    # ---- top rim bridge (outer top ring to inner top ring) ----
     top_j = seg_v
+    def o(ii, jj): return vid(ii, jj)
+    def inn(ii, jj): return outer_count + vid(ii, jj)
+
     for i in range(seg_u):
         i2 = i + 1
-        shell.Faces.AddFace(
-            shell_o(i, top_j),
-            shell_o(i2, top_j),
-            shell_i(i2, top_j),
-            shell_i(i, top_j)
-        )
+        shell.Faces.AddFace(o(i, top_j), o(i2, top_j), inn(i2, top_j), inn(i, top_j))
 
     shell.UnifyNormals()
     shell.Normals.ComputeNormals()
@@ -242,81 +155,58 @@ def build_bucket_mesh(
 
     return shell
 
-# -------------------------
-# UI / Main
-# -------------------------
 def main():
     rs.EnableRedraw(False)
 
     base = rs.GetPoint("Bucket center (base)")
     if not base:
-        rs.EnableRedraw(True)
-        return
+        rs.EnableRedraw(True); return
     base_pt = Rhino.Geometry.Point3d(base.X, base.Y, base.Z)
 
     H = rs.GetReal("Height (mm)", 90.0, 10.0, 2000.0)
-    if H is None:
-        rs.EnableRedraw(True); return
+    if H is None: rs.EnableRedraw(True); return
 
     Rin = rs.GetReal("Inner radius (mm)", 55.0, 5.0, 2000.0)
-    if Rin is None:
-        rs.EnableRedraw(True); return
+    if Rin is None: rs.EnableRedraw(True); return
 
     T = rs.GetReal("Wall thickness (mm)", 4.0, 0.5, 200.0)
-    if T is None:
-        rs.EnableRedraw(True); return
+    if T is None: rs.EnableRedraw(True); return
 
-    B = rs.GetReal("Base thickness (mm)", 5.0, 0.5, H * 0.9)
-    if B is None:
-        rs.EnableRedraw(True); return
+    B = rs.GetReal("Base thickness (mm)", 5.0, 0.5, H*0.9)
+    if B is None: rs.EnableRedraw(True); return
 
-    # mesh resolution
-    seg_u = rs.GetInteger("Segments around (80-180)", 120, 24, 500)
-    if seg_u is None:
-        rs.EnableRedraw(True); return
+    diamonds_around = rs.GetInteger("Diamonds around (4-8)", 5, 2, 40)
+    if diamonds_around is None: rs.EnableRedraw(True); return
 
-    seg_v = rs.GetInteger("Segments height (30-80)", 48, 10, 300)
-    if seg_v is None:
-        rs.EnableRedraw(True); return
+    diamonds_vertical = rs.GetInteger("Diamonds vertical (2-6)", 3, 1, 40)
+    if diamonds_vertical is None: rs.EnableRedraw(True); return
 
-    # pattern controls
-    diamonds_around = rs.GetInteger("Diamonds around (4-8)", 5, 2, 30)
-    if diamonds_around is None:
-        rs.EnableRedraw(True); return
+    facet_depth = rs.GetReal("Facet depth (mm) (1-8)", 3.0, 0.0, 30.0)
+    if facet_depth is None: rs.EnableRedraw(True); return
 
-    diamonds_vertical = rs.GetInteger("Diamonds vertical (2-6)", 3, 1, 30)
-    if diamonds_vertical is None:
-        rs.EnableRedraw(True); return
+    bevel_h = rs.GetReal("Bevel band height (mm)", 6.0, 0.0, H*0.45)
+    if bevel_h is None: rs.EnableRedraw(True); return
 
-    facet_depth = rs.GetReal("Facet depth (mm) (1-6)", 3.0, 0.0, 30.0)
-    if facet_depth is None:
-        rs.EnableRedraw(True); return
+    bevel_in = rs.GetReal("Bevel inset (mm)", 2.0, 0.0, 30.0)
+    if bevel_in is None: rs.EnableRedraw(True); return
 
-    # optional: subtle waist like the photo
-    waist_amp = rs.GetReal("Waist amplitude (mm) (0 for none)", 1.5, 0.0, 30.0)
-    if waist_amp is None:
-        rs.EnableRedraw(True); return
-
-    mesh = build_bucket_mesh(
+    mesh = build_faceted_bucket(
         base_pt=base_pt,
         height=H,
         inner_radius=Rin,
         wall_thickness=T,
         base_thickness=B,
-        seg_u=seg_u,
-        seg_v=seg_v,
         diamonds_around=diamonds_around,
         diamonds_vertical=diamonds_vertical,
         facet_depth=facet_depth,
-        fade_zone=0.12,
-        facet_softness=0.18,  # lower = harder facets
-        waist_amp=waist_amp,
-        waist_cycles=1.0
+        fade_zone=0.10,
+        bevel_height=bevel_h,
+        bevel_inset=bevel_in
     )
 
     if mesh:
-        # Hard edges so facets read better (adjust angle if needed)
-        mesh.Unweld(math.radians(30.0), True)
+        # make facets read sharper
+        mesh.Unweld(math.radians(35.0), True)
         sc.doc.Objects.AddMesh(mesh)
         sc.doc.Views.Redraw()
 
@@ -324,4 +214,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
