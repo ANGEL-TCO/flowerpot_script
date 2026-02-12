@@ -6,26 +6,13 @@ import math
 # -------------------------
 # Helpers
 # -------------------------
-def clamp(v,a,b): return max(a,min(b,v))
-
-def smoothstep(t):
-    t = clamp(float(t), 0.0, 1.0)
-    return t*t*(3.0-2.0*t)
-
-def edge_fade(z01, fade_zone):
-    s = float(fade_zone)
-    if s <= 0.0: return 1.0
-    if z01 < s: return smoothstep(z01/s)
-    if z01 > 1.0 - s: return smoothstep((1.0-z01)/s)
-    return 1.0
+def clamp(v, a, b): 
+    return max(a, min(b, v))
 
 def stitch_rings_tri(mesh, ringA, ringB):
     """
     Stitch two closed rings (lists of vertex indices) with triangles.
     Works even if len(ringA) != len(ringB).
-
-    Assumption: both rings are ordered CCW when seen from outside,
-    and correspond roughly by angle (same orientation).
     """
     nA = len(ringA)
     nB = len(ringB)
@@ -34,12 +21,10 @@ def stitch_rings_tri(mesh, ringA, ringB):
 
     i = 0
     j = 0
-    # Use normalized progress around each ring to decide next triangle
     while i < nA and j < nB:
         i2 = (i + 1) % nA
         j2 = (j + 1) % nB
 
-        # progress ratios (0..1)
         a_next = float(i + 1) / float(nA)
         b_next = float(j + 1) / float(nB)
 
@@ -49,156 +34,164 @@ def stitch_rings_tri(mesh, ringA, ringB):
         b1 = ringB[j2]
 
         if a_next < b_next:
-            # advance A: triangle (a0, a1, b0)
             mesh.Faces.AddFace(a0, a1, b0)
             i += 1
-            if i == nA: break
+            if i == nA:
+                break
         elif b_next < a_next:
-            # advance B: triangle (a0, b1, b0)
             mesh.Faces.AddFace(a0, b1, b0)
             j += 1
-            if j == nB: break
+            if j == nB:
+                break
         else:
-            # advance both: quad split into 2 tris
             mesh.Faces.AddFace(a0, a1, b1)
             mesh.Faces.AddFace(a0, b1, b0)
             i += 1
             j += 1
-            if i == nA or j == nB: break
+            if i == nA or j == nB:
+                break
 
 # -------------------------
-# Build
+# Outer wall: ring stack + alternating rotation
 # -------------------------
-def build_faceted_bucket(
+def add_ngon_ring(mesh, base_pt, radius, z, sides, theta_offset=0.0):
+    """
+    Adds one polygon ring (sides points) to a mesh and returns the list of vertex indices.
+    CCW order when viewed from +Z.
+    """
+    idx = []
+    for i in range(sides):
+        theta = (2.0 * math.pi * i / float(sides)) + theta_offset
+        x = base_pt.X + radius * math.cos(theta)
+        y = base_pt.Y + radius * math.sin(theta)
+        idx.append(mesh.Vertices.Add(x, y, base_pt.Z + z))
+    return idx
+
+def connect_rings_as_tris(mesh, ring0, ring1, flip_diag=False):
+    """
+    Connect two equal-length rings (same number of sides) using 2 triangles per side.
+    flip_diag=False uses diagonal (a-d).
+    flip_diag=True  uses diagonal (b-c).
+    Alternating this per band prevents the "stretched rows".
+    """
+    n = len(ring0)
+    for i in range(n):
+        a = ring0[i]
+        b = ring0[(i + 1) % n]
+        c = ring1[i]
+        d = ring1[(i + 1) % n]
+
+        if not flip_diag:
+            # diagonal a-d (your previous version)
+            mesh.Faces.AddFace(a, c, d)
+            mesh.Faces.AddFace(a, d, b)
+        else:
+            # diagonal b-c (the alternate split)
+            mesh.Faces.AddFace(a, b, c)
+            mesh.Faces.AddFace(b, d, c)
+
+
+# -------------------------
+# Full bucket build
+# -------------------------
+def build_bucket(
     base_pt,
     height,
     inner_radius,
     wall_thickness,
     base_thickness,
-    diamonds_around=5,
-    diamonds_vertical=3,
-    facet_depth=3.0,
-    fade_zone=0.10,
-    bevel_height=6.0,
-    bevel_inset=2.0,
-    inner_seg_u=120  # <- IMPORTANT: independent inner resolution for perfect circle
+    sides=9,
+    rings=8,                 # number of polygon rings from bottom to top (>=2)
+    inner_circle_segments=180 # smooth inner cylinder resolution
 ):
     H   = float(height)
     Rin = float(inner_radius)
     T   = float(wall_thickness)
     B   = float(base_thickness)
 
-    Rout = Rin + T
     B = clamp(B, 0.5, H * 0.9)
+    Rout = Rin + T
 
-    # --- OUTER topology matches rhombus grid ---
-    outer_seg_u = max(6, int(2 * diamonds_around))       # corners around
-    outer_seg_v = max(2, int(2 * diamonds_vertical))     # rings up
-    outer_cols  = outer_seg_u + 1
-    outer_rows  = outer_seg_v + 1
+    sides = max(3, int(sides))
+    rings = max(2, int(rings))
+    inner_circle_segments = max(24, int(inner_circle_segments))
 
-    # --- INNER topology: smooth circle, no offsets ---
-    inner_seg_u = max(24, int(inner_seg_u))
-    inner_seg_v = outer_seg_v  # keep same vertical ring count for consistency
-    inner_cols  = inner_seg_u + 1
-    inner_rows  = inner_seg_v + 1
-
+    # ---- OUTER mesh (polygon rings + triangles) ----
     outer = Rhino.Geometry.Mesh()
-    inner = Rhino.Geometry.Mesh()
 
-    # -------------------------
-    # OUTER vertices (faceted)
-    # -------------------------
-    for j in range(outer_rows):
-        v01 = float(j) / float(outer_seg_v)
-        z = H * v01
+    # ring z positions (linear)
+    rings_idx = []
+    half_step = math.pi / float(sides)   # rotate by half a segment
 
-        theta_off = (math.pi / outer_seg_u) if (j % 2 == 1) else 0.0
-        fade = edge_fade(v01, fade_zone)
+    for r in range(rings):
+        t = float(r) / float(rings - 1)  # 0..1
+        z = H * t
+        # alternating rotation: even ring = no offset, odd ring = half-step offset
+        theta_off = half_step if (r % 2 == 1) else 0.0
+        ring = add_ngon_ring(outer, base_pt, Rout, z, sides, theta_off)
+        rings_idx.append(ring)
 
-        # bevel band to keep rim/base cleaner & more "straight"
-        bevel = 0.0
-        if bevel_height > 0.0:
-            if z < bevel_height:
-                t = 1.0 - (z / bevel_height)
-                bevel = -bevel_inset * smoothstep(t)
-            elif z > (H - bevel_height):
-                t = 1.0 - ((H - z) / bevel_height)
-                bevel = -bevel_inset * smoothstep(t)
+    # connect rings
+    for r in range(rings - 1):
+        flip = (r % 2 == 0)  # alternate per band
+        connect_rings_as_tris(outer, rings_idx[r], rings_idx[r + 1], flip_diag=flip)
 
-        for i in range(outer_cols):
-            u01 = float(i) / float(outer_seg_u)
-            theta = 2.0 * math.pi * u01 + theta_off
 
-            # checkerboard relief (crisp facets)
-            s = 1.0 if ((i + j) % 2 == 0) else -1.0
-            relief = facet_depth * fade * s
-
-            r_out = Rout + relief + bevel
-
-            x = base_pt.X + r_out * math.cos(theta)
-            y = base_pt.Y + r_out * math.sin(theta)
-            zz = base_pt.Z + z
-            outer.Vertices.Add(x, y, zz)
-
-    def o_vid(ii, jj):
-        return jj * outer_cols + ii
-
-    for j in range(outer_seg_v):
-        for i in range(outer_seg_u):
-            a = o_vid(i, j)
-            b = o_vid(i + 1, j)
-            c = o_vid(i + 1, j + 1)
-            d = o_vid(i, j + 1)
-            outer.Faces.AddFace(a, b, c, d)
-
-    # Outer bottom cap
+    # outer bottom cap (fan)
     outer_center = outer.Vertices.Add(base_pt.X, base_pt.Y, base_pt.Z)
-    for i in range(outer_seg_u):
-        outer.Faces.AddFace(outer_center, o_vid(i + 1, 0), o_vid(i, 0))
+    bottom_ring = rings_idx[0]
+    for i in range(sides):
+        b0 = bottom_ring[i]
+        b1 = bottom_ring[(i + 1) % sides]
+        outer.Faces.AddFace(outer_center, b1, b0)
 
+    outer.UnifyNormals()
     outer.Normals.ComputeNormals()
     outer.Compact()
 
-    # -------------------------
-    # INNER vertices (perfect circle)
-    # Inner starts at z=B (floor), up to z=H
-    # -------------------------
+    # ---- INNER mesh (perfect circular cylinder) ----
+    inner = Rhino.Geometry.Mesh()
+
+    inner_cols = inner_circle_segments
+    inner_rows = max(2, rings)  # follow similar vertical density
+
+    inner_rings = []
     for j in range(inner_rows):
-        v01 = float(j) / float(inner_seg_v)
-        z = B + (H - B) * v01
-
+        v01 = float(j) / float(inner_rows - 1)
+        z = B + (H - B) * v01  # inner starts at floor thickness
+        ring = []
         for i in range(inner_cols):
-            u01 = float(i) / float(inner_seg_u)
-            theta = 2.0 * math.pi * u01  # <- no offset, uniform circle
-
+            theta = 2.0 * math.pi * (float(i) / float(inner_cols))
             x = base_pt.X + Rin * math.cos(theta)
             y = base_pt.Y + Rin * math.sin(theta)
-            zz = base_pt.Z + z
-            inner.Vertices.Add(x, y, zz)
+            ring.append(inner.Vertices.Add(x, y, base_pt.Z + z))
+        inner_rings.append(ring)
 
-    def i_vid(ii, jj):
-        return jj * inner_cols + ii
+    # inner side faces (quads split into tris)
+    for j in range(inner_rows - 1):
+        r0 = inner_rings[j]
+        r1 = inner_rings[j + 1]
+        for i in range(inner_cols):
+            a = r0[i]
+            b = r0[(i + 1) % inner_cols]
+            c = r1[i]
+            d = r1[(i + 1) % inner_cols]
+            inner.Faces.AddFace(a, c, d)
+            inner.Faces.AddFace(a, d, b)
 
-    for j in range(inner_seg_v):
-        for i in range(inner_seg_u):
-            a = i_vid(i, j)
-            b = i_vid(i + 1, j)
-            c = i_vid(i + 1, j + 1)
-            d = i_vid(i, j + 1)
-            inner.Faces.AddFace(a, b, c, d)
-
-    # Inner floor cap at z=B
+    # inner floor cap at z=B
     inner_center = inner.Vertices.Add(base_pt.X, base_pt.Y, base_pt.Z + B)
-    for i in range(inner_seg_u):
-        inner.Faces.AddFace(inner_center, i_vid(i, 0), i_vid(i + 1, 0))
+    floor_ring = inner_rings[0]
+    for i in range(inner_cols):
+        a = floor_ring[i]
+        b = floor_ring[(i + 1) % inner_cols]
+        inner.Faces.AddFace(inner_center, a, b)
 
+    inner.UnifyNormals()
     inner.Normals.ComputeNormals()
     inner.Compact()
 
-    # -------------------------
-    # Combine into closed shell
-    # -------------------------
+    # ---- Combine: outer + flipped inner + stitched top rim ----
     inner2 = inner.DuplicateMesh()
     inner2.Flip(True, True, True)
 
@@ -207,11 +200,10 @@ def build_faceted_bucket(
     outer_count = outer.Vertices.Count
     shell.Append(inner2)
 
-    # Top ring indices
-    outer_top_ring = [o_vid(i, outer_seg_v) for i in range(outer_seg_u)]  # no seam dup
-    inner_top_ring = [outer_count + i_vid(i, inner_seg_v) for i in range(inner_seg_u)]  # no seam dup
+    # stitch top rim (outer polygon top ring -> inner circle top ring)
+    outer_top_ring = rings_idx[-1]  # polygon ring at z=H
+    inner_top_ring = [outer_count + vid for vid in inner_rings[-1]]  # offset into shell
 
-    # Stitch top rim between outer and inner (triangles)
     stitch_rings_tri(shell, outer_top_ring, inner_top_ring)
 
     shell.UnifyNormals()
@@ -240,44 +232,31 @@ def main():
     T = rs.GetReal("Wall thickness (mm)", 4.0, 0.5, 200.0)
     if T is None: rs.EnableRedraw(True); return
 
-    B = rs.GetReal("Base thickness (mm)", 5.0, 0.5, H*0.9)
+    B = rs.GetReal("Base thickness (mm)", 5.0, 0.5, H * 0.9)
     if B is None: rs.EnableRedraw(True); return
 
-    diamonds_around = rs.GetInteger("Diamonds around (4-8)", 5, 2, 40)
-    if diamonds_around is None: rs.EnableRedraw(True); return
+    sides = rs.GetInteger("Outer polygon sides (e.g., 9)", 9, 3, 64)
+    if sides is None: rs.EnableRedraw(True); return
 
-    diamonds_vertical = rs.GetInteger("Diamonds vertical (2-6)", 3, 1, 40)
-    if diamonds_vertical is None: rs.EnableRedraw(True); return
+    rings = rs.GetInteger("Number of outer rings (6-20)", 10, 2, 200)
+    if rings is None: rs.EnableRedraw(True); return
 
-    facet_depth = rs.GetReal("Facet depth (mm) (1-8)", 3.0, 0.0, 30.0)
-    if facet_depth is None: rs.EnableRedraw(True); return
+    inner_segs = rs.GetInteger("Inner circle segments (120-260 recommended)", 200, 24, 800)
+    if inner_segs is None: rs.EnableRedraw(True); return
 
-    bevel_h = rs.GetReal("Bevel band height (mm)", 6.0, 0.0, H*0.45)
-    if bevel_h is None: rs.EnableRedraw(True); return
-
-    bevel_in = rs.GetReal("Bevel inset (mm)", 2.0, 0.0, 30.0)
-    if bevel_in is None: rs.EnableRedraw(True); return
-
-    inner_seg_u = rs.GetInteger("Inner circle segments (80-200)", 140, 24, 400)
-    if inner_seg_u is None: rs.EnableRedraw(True); return
-
-    mesh = build_faceted_bucket(
+    mesh = build_bucket(
         base_pt=base_pt,
         height=H,
         inner_radius=Rin,
         wall_thickness=T,
         base_thickness=B,
-        diamonds_around=diamonds_around,
-        diamonds_vertical=diamonds_vertical,
-        facet_depth=facet_depth,
-        fade_zone=0.10,
-        bevel_height=bevel_h,
-        bevel_inset=bevel_in,
-        inner_seg_u=inner_seg_u
+        sides=sides,
+        rings=rings,
+        inner_circle_segments=inner_segs
     )
 
     if mesh:
-        # Keep outer facets crisp
+        # Make facets read crisp
         mesh.Unweld(math.radians(35.0), True)
         sc.doc.Objects.AddMesh(mesh)
         sc.doc.Views.Redraw()
