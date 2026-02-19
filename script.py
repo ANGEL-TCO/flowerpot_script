@@ -226,10 +226,10 @@ def main():
     H = rs.GetReal("Height (mm)", 90.0, 10.0, 2000.0)
     if H is None: rs.EnableRedraw(True); return
 
-    Rin = rs.GetReal("Inner radius (mm)", 55.0, 5.0, 2000.0)
+    Rin = rs.GetReal("Inner radius (mm)", 45.0, 5.0, 2000.0)
     if Rin is None: rs.EnableRedraw(True); return
 
-    T = rs.GetReal("Wall thickness (mm)", 4.0, 0.5, 200.0)
+    T = rs.GetReal("Wall thickness (mm)", 9.0, 0.5, 200.0)
     if T is None: rs.EnableRedraw(True); return
 
     B = rs.GetReal("Base thickness (mm)", 5.0, 0.5, H * 0.9)
@@ -238,7 +238,7 @@ def main():
     sides = rs.GetInteger("Outer polygon sides (e.g., 9)", 9, 3, 64)
     if sides is None: rs.EnableRedraw(True); return
 
-    rings = rs.GetInteger("Number of outer rings (6-20)", 10, 2, 200)
+    rings = rs.GetInteger("Number of outer rings (6-20)", 7, 2, 200)
     if rings is None: rs.EnableRedraw(True); return
 
     inner_segs = rs.GetInteger("Inner circle segments (120-260 recommended)", 200, 24, 800)
